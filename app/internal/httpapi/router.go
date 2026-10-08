@@ -8,16 +8,21 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/curioso/extenddb-yugabytedb/app/internal/compat"
 	"github.com/curioso/extenddb-yugabytedb/app/internal/store"
+	"github.com/curioso/extenddb-yugabytedb/app/internal/workload"
 )
 
 type Handler struct {
-	cellID string
-	users  *store.UserStore
+	cellID    string
+	opTimeout time.Duration
+	users     *store.UserStore
+	work      *workload.Store
+	compat    *compat.Suite
 }
 
-func NewRouter(cellID string, users *store.UserStore) *gin.Engine {
-	h := &Handler{cellID: cellID, users: users}
+func NewRouter(cellID string, opTimeout time.Duration, users *store.UserStore, work *workload.Store, suite *compat.Suite) *gin.Engine {
+	h := &Handler{cellID: cellID, opTimeout: opTimeout, users: users, work: work, compat: suite}
 
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery(), h.cellHeader)
@@ -25,6 +30,8 @@ func NewRouter(cellID string, users *store.UserStore) *gin.Engine {
 	r.GET("/health", h.health)
 	r.POST("/users", h.putUser)
 	r.GET("/users/:id", h.getUser)
+	h.workloadRoutes(r)
+	h.compatRoutes(r)
 	return r
 }
 

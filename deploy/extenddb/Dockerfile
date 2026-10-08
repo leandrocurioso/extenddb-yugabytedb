@@ -2,7 +2,7 @@
 # Only the binary is rebuilt; the runtime layer is the official image, so user,
 # entrypoint, healthcheck and hardening are unchanged.
 ARG EXTENDDB_VERSION=0.1.13
-ARG EXTENDDB_COMMIT=29b6b7fa183d99d2109e87faa2e394772906f312
+ARG EXTENDDB_COMMIT=6dc425373814cfef5f885cfb68502cd8144ba2d5
 
 FROM rust:1.88-bookworm AS build
 ARG EXTENDDB_VERSION

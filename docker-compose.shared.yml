@@ -1,0 +1,338 @@
+# Shared-database test configuration (used by the compat and chaos tests).
+#
+# Same three cells as docker-compose.yml, but all three ExtendDB instances serve
+# ONE catalog + data database on the shared YugabyteDB cluster, so a table
+# written through one cell is visible through the others. Each cell still has
+# its own YB node, and a cell's users-api only talks to its own ExtendDB, which
+# only talks to its own YB node:
+#
+#   cell1: users-api-cell1 -> extenddb-cell1 -> yb-cell1 ┐
+#   cell2: users-api-cell2 -> extenddb-cell2 -> yb-cell2 ├─ one cluster, one database
+#   cell3: users-api-cell3 -> extenddb-cell3 -> yb-cell3 ┘
+#
+# `extenddb init` runs once (through yb-cell1) and stores the data database's
+# connection string in the catalog, so all instances share one config. That
+# config names the database host `yb-local`; each container resolves it to its
+# own cell's node through a compose link alias.
+#
+# Uses the same host ports as docker-compose.yml: run one stack at a time.
+# `make shared-up` / `make shared-down`. Passwords and keys are dev-only defaults.
+name: extenddb-shared
+
+x-yugabyte: &yugabyte
+  image: ${YUGABYTE_IMAGE:-yugabytedb/yugabyte:2025.2.7.0-b107}
+  profiles: ["cells"]
+  entrypoint: ["/bin/bash", "/scripts/start.sh"]
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "postgres/bin/pg_isready -h $$(hostname) -p 5433"]
+    interval: 5s
+    timeout: 5s
+    retries: 60
+    start_period: 30s
+
+# Official ExtendDB 0.1.13 runtime with a rebuilt binary: upstream verifies its
+# migration advisory lock via pg_locks.pid, which YugabyteDB reports as NULL.
+# See deploy/extenddb/patches.
+x-extenddb: &extenddb
+  image: extenddb-yugabyte:0.1.13
+  build:
+    context: ./deploy/extenddb
+  profiles: ["cells"]
+
+x-extenddb-hardening: &extenddb-hardening
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:${NO_NEW_PRIVILEGES:-true}
+
+x-extenddb-volume-init: &extenddb-volume-init
+  <<: *extenddb
+  user: "0:0"
+  read_only: true
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+  security_opt:
+    - no-new-privileges:${NO_NEW_PRIVILEGES:-true}
+  entrypoint: ["/bin/sh", "-ec"]
+  command: ["chown -R 10001:10001 /var/lib/extenddb"]
+  restart: "no"
+
+x-extenddb-bootstrap-env: &extenddb-bootstrap-env
+  PG_PORT: "5433"
+  PG_ADMIN_USER: yugabyte
+  EXTENDDB_PG_PASSWORD: ${YB_PASSWORD:-yugabyte}
+  EXTENDDB_APP_PASSWORD: ${EXTENDDB_APP_DB_PASSWORD:-ExtendDBLocalApp123}
+  EXTENDDB_ADMIN_USER: ${EXTENDDB_ADMIN_USER:-admin}
+  EXTENDDB_ADMIN_PASSWORD: ${EXTENDDB_ADMIN_PASSWORD:-ExtendDBLocalAdmin123}
+
+x-extenddb-bootstrap: &extenddb-bootstrap
+  <<: [*extenddb, *extenddb-hardening]
+  entrypoint: ["/bin/sh", "/scripts/bootstrap.sh"]
+  restart: "no"
+
+x-extenddb-server: &extenddb-server
+  <<: [*extenddb, *extenddb-hardening]
+  depends_on:
+    extenddb-bootstrap: { condition: service_completed_successfully }
+  healthcheck:
+    test: ["CMD", "extenddb", "healthcheck", "--config", "/var/lib/extenddb/extenddb.toml"]
+    interval: 5s
+    timeout: 5s
+    retries: 30
+  stop_grace_period: 15s
+  restart: unless-stopped
+
+x-extenddb-server-volumes: &extenddb-server-volumes
+  - extenddb-state:/var/lib/extenddb:ro
+  - extenddb-exchange:/var/lib/extenddb-exchange
+
+x-extenddb-provision-env: &extenddb-provision-env
+  EXTENDDB_ADMIN_USER: ${EXTENDDB_ADMIN_USER:-admin}
+  EXTENDDB_ADMIN_PASSWORD: ${EXTENDDB_ADMIN_PASSWORD:-ExtendDBLocalAdmin123}
+  APP_USER: users-api
+
+x-extenddb-provision: &extenddb-provision
+  <<: [*extenddb, *extenddb-hardening]
+  entrypoint: ["/bin/sh", "/scripts/provision.sh"]
+  restart: "no"
+
+x-app: &app
+  build:
+    context: ./app
+  image: users-api:dev
+  profiles: ["cells"]
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:${NO_NEW_PRIVILEGES:-true}
+  healthcheck:
+    test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/health"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+    start_period: 5s
+  restart: unless-stopped
+  volumes:
+    - extenddb-state:/extenddb:ro
+
+x-app-env: &app-env
+  HTTP_ADDR: ":8080"
+  AWS_REGION: us-east-1
+  DYNAMODB_TABLE: users
+  # One self-signed cert, valid for all three extenddb-cellN names.
+  AWS_CA_BUNDLE: /extenddb/.extenddb/tls/cert.pem
+
+services:
+  # ---------------------------------------------------------------- YugabyteDB
+  yb-cell1:
+    <<: *yugabyte
+    hostname: yb-cell1
+    environment: { YB_NODE: yb-cell1, YB_CELL: cell1 }
+    ports:
+      - "127.0.0.1:15433:15433" # yugabyted UI
+    volumes:
+      - yb-cell1-data:/root/var
+      - ./deploy/yugabyte:/scripts:ro
+
+  yb-cell2:
+    <<: *yugabyte
+    hostname: yb-cell2
+    environment: { YB_NODE: yb-cell2, YB_CELL: cell2, YB_JOIN: yb-cell1 }
+    depends_on: [yb-cell1]
+    volumes:
+      - yb-cell2-data:/root/var
+      - ./deploy/yugabyte:/scripts:ro
+
+  yb-cell3:
+    <<: *yugabyte
+    hostname: yb-cell3
+    environment: { YB_NODE: yb-cell3, YB_CELL: cell3, YB_JOIN: yb-cell2 }
+    depends_on: [yb-cell2]
+    volumes:
+      - yb-cell3-data:/root/var
+      - ./deploy/yugabyte:/scripts:ro
+
+  yb-init-roles:
+    image: ${YUGABYTE_IMAGE:-yugabytedb/yugabyte:2025.2.7.0-b107}
+    profiles: ["cells"]
+    depends_on:
+      yb-cell1: { condition: service_healthy }
+      yb-cell2: { condition: service_healthy }
+      yb-cell3: { condition: service_healthy }
+    entrypoint: ["/bin/bash", "/scripts/init-roles.sh"]
+    environment:
+      YB_HOST: yb-cell1
+      EXTENDDB_ROLES: extenddb
+      EXTENDDB_APP_PASSWORD: ${EXTENDDB_APP_DB_PASSWORD:-ExtendDBLocalApp123}
+    volumes:
+      - ./deploy/yugabyte:/scripts:ro
+    restart: "no"
+
+  # ----------------------------------------------------------------- ExtendDB
+  extenddb-volume-init:
+    <<: *extenddb-volume-init
+    command: ["chown -R 10001:10001 /var/lib/extenddb /var/lib/extenddb-exchange"]
+    volumes:
+      - extenddb-state:/var/lib/extenddb
+      - extenddb-exchange:/var/lib/extenddb-exchange
+
+  extenddb-bootstrap:
+    <<: *extenddb-bootstrap
+    depends_on:
+      yb-init-roles: { condition: service_completed_successfully }
+      extenddb-volume-init: { condition: service_completed_successfully }
+    links: ["yb-cell1:yb-local"]
+    environment:
+      <<: *extenddb-bootstrap-env
+      CELL_ID: shared
+      PG_HOST: yb-local
+      APP_DB_USER: extenddb
+      DATA_DB: extenddb
+      TLS_SAN: extenddb-cell1 extenddb-cell2 extenddb-cell3
+      EXCHANGE_DIR: /var/lib/extenddb-exchange
+    volumes:
+      - extenddb-state:/var/lib/extenddb
+      - ./deploy/extenddb:/scripts:ro
+
+  extenddb-cell1:
+    <<: *extenddb-server
+    links: ["yb-cell1:yb-local"]
+    ports:
+      - "127.0.0.1:18441:18443"
+    volumes: *extenddb-server-volumes
+
+  extenddb-cell2:
+    <<: *extenddb-server
+    links: ["yb-cell2:yb-local"]
+    ports:
+      - "127.0.0.1:18442:18443"
+    volumes: *extenddb-server-volumes
+
+  extenddb-cell3:
+    <<: *extenddb-server
+    links: ["yb-cell3:yb-local"]
+    ports:
+      - "127.0.0.1:18443:18443"
+    volumes: *extenddb-server-volumes
+
+  # One IAM user for the shared account, with one access key per cell.
+  extenddb-provision:
+    <<: *extenddb-provision
+    depends_on:
+      extenddb-cell1: { condition: service_healthy }
+      extenddb-cell2: { condition: service_healthy }
+      extenddb-cell3: { condition: service_healthy }
+    environment:
+      <<: *extenddb-provision-env
+      CELL_ID: shared
+      EXTENDDB_ENDPOINT: https://extenddb-cell1:18443
+      APP_ACCESS_KEYS: >-
+        ${CELL1_ACCESS_KEY_ID:-AKIACELL1USERSAPI001}:${CELL1_SECRET_ACCESS_KEY:-cell1LocalDevSecretKeyDoNotUseInProd0001}
+        ${CELL2_ACCESS_KEY_ID:-AKIACELL2USERSAPI001}:${CELL2_SECRET_ACCESS_KEY:-cell2LocalDevSecretKeyDoNotUseInProd0001}
+        ${CELL3_ACCESS_KEY_ID:-AKIACELL3USERSAPI001}:${CELL3_SECRET_ACCESS_KEY:-cell3LocalDevSecretKeyDoNotUseInProd0001}
+    volumes:
+      - extenddb-state:/var/lib/extenddb:ro
+      - ./deploy/extenddb:/scripts:ro
+
+  # ---------------------------------------------------------------- users-api
+  users-api-cell1:
+    <<: *app
+    depends_on:
+      extenddb-provision: { condition: service_completed_successfully }
+    environment:
+      <<: *app-env
+      CELL_ID: cell1
+      DYNAMODB_ENDPOINT: https://extenddb-cell1:18443
+      AWS_ACCESS_KEY_ID: ${CELL1_ACCESS_KEY_ID:-AKIACELL1USERSAPI001}
+      AWS_SECRET_ACCESS_KEY: ${CELL1_SECRET_ACCESS_KEY:-cell1LocalDevSecretKeyDoNotUseInProd0001}
+    ports:
+      - "127.0.0.1:8081:8080"
+
+  users-api-cell2:
+    <<: *app
+    depends_on:
+      extenddb-provision: { condition: service_completed_successfully }
+    environment:
+      <<: *app-env
+      CELL_ID: cell2
+      DYNAMODB_ENDPOINT: https://extenddb-cell2:18443
+      AWS_ACCESS_KEY_ID: ${CELL2_ACCESS_KEY_ID:-AKIACELL2USERSAPI001}
+      AWS_SECRET_ACCESS_KEY: ${CELL2_SECRET_ACCESS_KEY:-cell2LocalDevSecretKeyDoNotUseInProd0001}
+    ports:
+      - "127.0.0.1:8082:8080"
+
+  users-api-cell3:
+    <<: *app
+    depends_on:
+      extenddb-provision: { condition: service_completed_successfully }
+    environment:
+      <<: *app-env
+      CELL_ID: cell3
+      DYNAMODB_ENDPOINT: https://extenddb-cell3:18443
+      AWS_ACCESS_KEY_ID: ${CELL3_ACCESS_KEY_ID:-AKIACELL3USERSAPI001}
+      AWS_SECRET_ACCESS_KEY: ${CELL3_SECRET_ACCESS_KEY:-cell3LocalDevSecretKeyDoNotUseInProd0001}
+    ports:
+      - "127.0.0.1:8083:8080"
+
+  # --------------------------------------------------------------- monitoring
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    profiles: ["monitoring"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      # k6 pushes load-test metrics here (experimental-prometheus-rw output).
+      - --web.enable-remote-write-receiver
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    profiles: ["monitoring"]
+    depends_on:
+      prometheus: { condition: service_healthy }
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  yb-cell1-data:
+  yb-cell2-data:
+  yb-cell3-data:
+  extenddb-state:
+  extenddb-exchange:
+  prometheus-data:
+  grafana-data:

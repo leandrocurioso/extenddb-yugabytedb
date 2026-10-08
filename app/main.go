@@ -12,10 +12,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 
+	"github.com/curioso/extenddb-yugabytedb/app/internal/compat"
 	"github.com/curioso/extenddb-yugabytedb/app/internal/config"
 	"github.com/curioso/extenddb-yugabytedb/app/internal/httpapi"
 	"github.com/curioso/extenddb-yugabytedb/app/internal/store"
+	"github.com/curioso/extenddb-yugabytedb/app/internal/workload"
 )
 
 func main() {
@@ -37,17 +40,35 @@ func main() {
 		o.BaseEndpoint = aws.String(cfg.DynamoDBEndpoint)
 	})
 
+	// The workload endpoints get a client that never retries: the chaos tests
+	// need each request to be one attempt that was acknowledged, rejected or
+	// left in doubt, and they do their own failover between cells.
+	singleAttempt := dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String(cfg.DynamoDBEndpoint)
+		o.RetryMaxAttempts = 1
+	})
+	streams := dynamodbstreams.NewFromConfig(awsCfg, func(o *dynamodbstreams.Options) {
+		o.BaseEndpoint = aws.String(cfg.DynamoDBEndpoint)
+	})
+
+	// With a shared database every cell creates the same tables at startup, so
+	// the workload tables are created with retries.
 	users := store.NewUserStore(client, cfg.DynamoDBTable)
-	initCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	initCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	err = users.EnsureTable(initCtx)
+	if err == nil {
+		err = workload.EnsureTables(initCtx, client)
+	}
 	cancel()
 	if err != nil {
-		log.Fatalf("ensure table: %v", err)
+		log.Fatalf("ensure tables: %v", err)
 	}
 
 	srv := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewRouter(cfg.CellID, users),
+		Addr: cfg.HTTPAddr,
+		Handler: httpapi.NewRouter(cfg.CellID, cfg.OpTimeout, users,
+			workload.New(singleAttempt, streams, cfg.CellID),
+			compat.NewSuite(client, streams, cfg.CellID, cfg.ExchangeDir)),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

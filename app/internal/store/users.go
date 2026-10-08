@@ -10,6 +10,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/curioso/extenddb-yugabytedb/app/internal/ddbx"
 )
 
 var ErrNotFound = errors.New("user not found")
@@ -34,16 +36,7 @@ func NewUserStore(client *dynamodb.Client, table string) *UserStore {
 
 // EnsureTable creates the table if it does not exist and waits until it is active.
 func (s *UserStore) EnsureTable(ctx context.Context) error {
-	_, err := s.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(s.table)})
-	if err == nil {
-		return nil
-	}
-	var notFound *types.ResourceNotFoundException
-	if !errors.As(err, &notFound) {
-		return fmt.Errorf("describe table %s: %w", s.table, err)
-	}
-
-	_, err = s.client.CreateTable(ctx, &dynamodb.CreateTableInput{
+	return ddbx.EnsureTable(ctx, s.client, &dynamodb.CreateTableInput{
 		TableName:   aws.String(s.table),
 		BillingMode: types.BillingModePayPerRequest,
 		AttributeDefinitions: []types.AttributeDefinition{
@@ -53,13 +46,6 @@ func (s *UserStore) EnsureTable(ctx context.Context) error {
 			{AttributeName: aws.String("id"), KeyType: types.KeyTypeHash},
 		},
 	})
-	var inUse *types.ResourceInUseException
-	if err != nil && !errors.As(err, &inUse) {
-		return fmt.Errorf("create table %s: %w", s.table, err)
-	}
-
-	waiter := dynamodb.NewTableExistsWaiter(s.client)
-	return waiter.Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(s.table)}, time.Minute)
 }
 
 // Ping verifies the table is reachable through ExtendDB.

@@ -20,9 +20,16 @@ make clean              # stop and delete all volumes (forces full re-bootstrap)
 make user-create CELL=2 ID=alice NAME="Alice" EMAIL=alice@example.com
 make user-get CELL=2 ID=alice
 make load LOAD_CELL=2 TPS=200 DURATION=5m WRITE_RATIO=0.2   # k6 via grafana/k6 image
+
+# Shared-database test stack (docker-compose.shared.yml) and its tests
+make shared-up / shared-down / shared-clean / shared-ps / shared-smoke
+make compat [CASES='^query/'] [COMPAT_STRICT=0]   # DynamoDB compatibility matrix -> reports/compat-*.md
+make consistency                                   # cross-cell invariants under load, no fault
+make chaos SCENARIO=yb-kill [CELL=2] [ALLOW=snapshot,stream]
+make chaos-all / make test-all
 ```
 
-Go app (module `github.com/curioso/extenddb-yugabytedb/app`, Go 1.26) — run from `app/`: `go build ./...`, `go vet ./...`. There are no tests yet. Running it outside Compose requires `DYNAMODB_ENDPOINT`, AWS credentials, and `AWS_CA_BUNDLE` pointing at the cell's self-signed ExtendDB cert.
+Go app (module `github.com/curioso/extenddb-yugabytedb/app`, Go 1.26) — run from `app/`: `go build ./...`, `go vet ./...`. There are no Go unit tests; the app is tested through the k6 suites above. Running it outside Compose requires `DYNAMODB_ENDPOINT`, AWS credentials, and `AWS_CA_BUNDLE` pointing at the cell's self-signed ExtendDB cert.
 
 A from-scratch `make up` takes ~9 minutes (YugabyteDB DDL is slow; each `extenddb init` takes 2–3 min). Restarts with existing volumes take under a minute.
 
@@ -48,6 +55,14 @@ The compose file uses YAML anchors (`x-yugabyte`, `x-extenddb-*`, `x-app`, `x-ap
 - `main.go`: AWS SDK v2 default config (credentials + CA bundle from env) with `BaseEndpoint` overridden to the cell's ExtendDB; calls `EnsureTable` at startup (creates the `users` table, hash key `id`, if missing).
 - `internal/store`: DynamoDB `UserStore` (PutItem, consistent GetItem, DescribeTable as Ping).
 - `internal/httpapi`: Gin router — `GET /health` (200 only if ExtendDB answers; used by the container healthcheck), `POST /users`, `GET /users/:id`. Every response carries `X-Cell-Id`.
+
+### Shared-database stack and tests
+
+- `docker-compose.shared.yml` (project `extenddb-shared`, same host ports as the per-cell stack — run one at a time): the three ExtendDB instances serve one catalog + data database. `extenddb init` runs once through `yb-cell1` (it refuses an existing database), and because ExtendDB keeps the data database's connection string in the catalog, all instances share one config that names the host `yb-local`; each container maps `yb-local` to its own cell's YB node with a compose `links` alias. Don't replace the alias with a real hostname: that would route every cell's data path through one node.
+- The deploy scripts are shared by both stacks and parametrized by env (`EXTENDDB_ROLES`, space-separated `TLS_SAN`, `EXCHANGE_DIR`, `APP_ACCESS_KEYS`).
+- `app/internal/workload`: the operations the consistency/chaos tests drive (tables `chaos_kv`, `chaos_orders`), on a DynamoDB client with retries disabled so one request is one attempt. HTTP status class is the contract: 2xx applied, 4xx not applied, 5xx unknown.
+- `app/internal/compat`: the compatibility cases (`cases_*.go`). A case asserts DynamoDB's documented behaviour; a failing case is a finding about ExtendDB, so don't weaken an assertion to make it pass. New SDK operations show up as "uncovered" in the report until a case lists them in `Ops`.
+- `loadtest/compat.js`, `loadtest/consistency.js` (+ `lib/cells.js`): k6 only talks HTTP to `users-api`; the AWS SDK in `users-api` is the only DynamoDB client. `chaos/run.sh` injects the faults (docker kill/pause/network disconnect) around `consistency.js` and always heals before exiting.
 
 ### Monitoring
 
