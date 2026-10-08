@@ -1,0 +1,53 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # YugabyteDB cluster (all 3 cells). Relabeling follows the official dashboard's
+  # requirements: https://github.com/yugabyte/yugabyte-db/tree/master/cloud/grafana
+  - job_name: yugabytedb
+    metrics_path: /prometheus-metrics
+    relabel_configs:
+      - target_label: node_prefix
+        replacement: extenddb-cells
+      # cell1/cell2/cell3 from the yb-cellN host, to filter by cell in ad-hoc queries.
+      - source_labels: [__address__]
+        regex: "yb-(cell[0-9]+):.*"
+        target_label: cell
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: "(.*)"
+        target_label: saved_name
+        replacement: "$1"
+      - source_labels: [__name__]
+        regex: "handler_latency_(yb_[^_]*)_([^_]*)_([^_]*)(.*)"
+        target_label: server_type
+        replacement: "$1"
+      - source_labels: [__name__]
+        regex: "handler_latency_(yb_[^_]*)_([^_]*)_([^_]*)(.*)"
+        target_label: service_type
+        replacement: "$2"
+      - source_labels: [__name__]
+        regex: "handler_latency_(yb_[^_]*)_([^_]*)_([^_]*)(_sum|_count)?"
+        target_label: service_method
+        replacement: "$3"
+      - source_labels: [__name__]
+        regex: "handler_latency_(yb_[^_]*)_([^_]*)_([^_]*)(_sum|_count)?"
+        target_label: __name__
+        replacement: "rpc_latency$4"
+    static_configs:
+      - targets: ["yb-cell1:7000", "yb-cell2:7000", "yb-cell3:7000"]
+        labels: { group: yb-master, export_type: master_export }
+      - targets: ["yb-cell1:9000", "yb-cell2:9000", "yb-cell3:9000"]
+        labels: { group: yb-tserver, export_type: tserver_export }
+      - targets: ["yb-cell1:12000", "yb-cell2:12000", "yb-cell3:12000"]
+        labels: { group: ycql, export_type: cql_export }
+      - targets: ["yb-cell1:13000", "yb-cell2:13000", "yb-cell3:13000"]
+        labels: { group: ysql, export_type: ysql_export }
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+# k6 pushes its metrics via remote write (prometheus runs with
+# --web.enable-remote-write-receiver); see `make load`.

@@ -1,0 +1,63 @@
+diff --git a/crates/storage-postgres/src/bootstrapper.rs b/crates/storage-postgres/src/bootstrapper.rs
+index a8827df..d2e85fd 100755
+--- a/crates/storage-postgres/src/bootstrapper.rs
++++ b/crates/storage-postgres/src/bootstrapper.rs
+@@ -392,17 +392,50 @@ impl Bootstrapper for PostgresBootstrapper {
+         // Guard against a key or lock-mode mismatch in the acquisition queries.
+         // `objsubid = 2` distinguishes the two-i32 advisory-lock keyspace from
+         // the one-i64 form, and `granted` excludes a merely waiting request.
+-        let held_by_this_transaction: bool = sqlx::query_scalar(
++        //
++        // YugabyteDB reports advisory locks in pg_locks with a NULL pid and
++        // identifies the holder by its distributed transaction id instead, and
++        // hides transactions younger than yb_locks_min_txn_age (default 1s).
++        let is_yugabyte: bool = sqlx::query_scalar("SELECT version() LIKE '%-YB-%'")
++            .fetch_one(&mut conn)
++            .await
++            .map_err(|e| OpError::Internal(format!("Cannot detect server flavor: {e}")))?;
++        let verify_sql = if is_yugabyte {
++            let _: String =
++                sqlx::query_scalar("SELECT set_config('yb_locks_min_txn_age', '0', true)")
++                    .fetch_one(&mut conn)
++                    .await
++                    .map_err(|e| {
++                        OpError::Internal(format!("Cannot configure lock visibility: {e}"))
++                    })?;
+             "SELECT EXISTS(SELECT 1 FROM pg_locks \
+              WHERE locktype = 'advisory' AND classid = $1 AND objid = $2 \
+                AND objsubid = 2 AND mode = 'ExclusiveLock' AND granted \
+-               AND pid = pg_backend_pid())",
+-        )
+-        .bind(ADVISORY_LOCK_NAMESPACE)
+-        .bind(MIGRATION_LOCK_OBJID)
+-        .fetch_one(&mut conn)
+-        .await
+-        .map_err(|e| OpError::Internal(format!("Cannot verify migration lock: {e}")))?;
++               AND (ybdetails->>'transactionid')::uuid = yb_get_current_transaction())"
++        } else {
++            "SELECT EXISTS(SELECT 1 FROM pg_locks \
++             WHERE locktype = 'advisory' AND classid = $1 AND objid = $2 \
++               AND objsubid = 2 AND mode = 'ExclusiveLock' AND granted \
++               AND pid = pg_backend_pid())"
++        };
++        // YugabyteDB's pg_locks is assembled from the lock tablets and can lag
++        // the acquisition briefly, so poll there instead of checking once.
++        let attempts = if is_yugabyte { 50 } else { 1 };
++        let mut held_by_this_transaction = false;
++        for attempt in 0..attempts {
++            if attempt > 0 {
++                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
++            }
++            held_by_this_transaction = sqlx::query_scalar(verify_sql)
++                .bind(ADVISORY_LOCK_NAMESPACE)
++                .bind(MIGRATION_LOCK_OBJID)
++                .fetch_one(&mut conn)
++                .await
++                .map_err(|e| OpError::Internal(format!("Cannot verify migration lock: {e}")))?;
++            if held_by_this_transaction {
++                break;
++            }
++        }
+         if !held_by_this_transaction {
+             return Err(OpError::Internal(
+                 "PostgreSQL did not report the migration transaction's advisory lock after \

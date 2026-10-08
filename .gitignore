@@ -1,0 +1,17 @@
+# Local overrides for credentials in docker-compose.yml
+.env
+.env.*
+
+# Go build output
+/app/users-api
+*.test
+*.out
+
+# Claude Code per-user settings
+.claude/settings.local.json
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
